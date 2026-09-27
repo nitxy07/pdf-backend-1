@@ -147,87 +147,596 @@ def extract_text(input_path: str) -> str:
 
 
 # ---------- TEXT BLOCKS (for real text editing, like Acrobat) ----------
+
+def _map_font(font_name: str, flags: int) -> str:
+    """Map a PDF font name + flags to a PyMuPDF base-14 fontname.
+
+    Preserves family (helvetica/arial -> helv, times/serif -> tiro,
+    courier/mono -> cour) and bold/italic so the export keeps the
+    original look instead of falling back to plain helvetica.
+    """
+    fn = (font_name or "").lower()
+    try:
+        f = int(flags or 0)
+    except Exception:
+        f = 0
+    bold = bool(f & 16) or ("bold" in fn or "black" in fn or "heavy" in fn or "demi" in fn)
+    italic = bool(f & 2) or ("italic" in fn or "oblique" in fn)
+
+    if "courier" in fn or "mono" in fn or "consol" in fn or fn.startswith("cour"):
+        if bold and italic:
+            return "cobi"
+        if bold:
+            return "cobo"
+        if italic:
+            return "coit"
+        return "cour"
+    if ("times" in fn or "serif" in fn or "georg" in fn or "garamond" in fn
+            or "roman" in fn or "tiro" in fn or "tibo" in fn):
+        if bold and italic:
+            return "tibi"
+        if bold:
+            return "tibo"
+        if italic:
+            return "tiit"
+        return "tiro"
+    # default: helvetica / arial / sans
+    if bold and italic:
+        return "hebi"
+    if bold:
+        return "hebo"
+    if italic:
+        return "heit"
+    return "helv"
+
+
+def _detect_block_align(line_bboxes, page_width, block_rect=None):
+    """Guess PyMuPDF textbox align for a paragraph block.
+
+    Returns 0=left, 1=center, 2=right, 3=justify.
+    Keeps an edited paragraph looking like the original instead of
+    everything collapsing to left-aligned.
+
+    NOTE: callers must NEVER pass align=3 straight into a single
+    insert_textbox() for the whole paragraph, because PyMuPDF stretches
+    the LAST (often short) line across the full width with huge word
+    gaps (the bug in the user screenshot). The writer below uses 3 only
+    for full body lines and 0/1 for the last line.
+    """
+    try:
+        pw = float(page_width)
+    except Exception:
+        pw = 595.0
+    if not line_bboxes:
+        return 0
+    if len(line_bboxes) == 1:
+        try:
+            lx0, _, lx1, _ = line_bboxes[0]
+            left_margin = float(lx0)
+            right_margin = pw - float(lx1)
+            line_w = float(lx1) - float(lx0)
+        except Exception:
+            return 0
+        if line_w < pw * 0.8 and abs(left_margin - right_margin) < 12:
+            return 1
+        if left_margin > pw * 0.25 and right_margin < 25:
+            return 2
+        return 0
+    try:
+        lefts = [float(b[0]) for b in line_bboxes]
+        rights = [float(b[2]) for b in line_bboxes]
+    except Exception:
+        return 0
+    rights_body = rights[:-1] if len(rights) > 2 else rights
+    left_spread = max(lefts) - min(lefts)
+    right_spread = max(rights_body) - min(rights_body)
+    if left_spread < 5 and right_spread < 9:
+        return 3  # justified: both edges straight
+    if left_spread < 5:
+        return 0
+    if right_spread < 7:
+        return 2
+    try:
+        centers = [(float(b[0]) + float(b[2])) / 2 for b in line_bboxes]
+        if max(centers) - min(centers) < 7:
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def _text_length(text: str, fontname: str, fontsize: float) -> float:
+    try:
+        return fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+    except Exception:
+        return len(text) * fontsize * 0.5
+
+
+def _reflow_words(words, fontname, fontsize, max_width):
+    """Greedy word-wrap into lines that fit max_width. Returns [line_str]."""
+    lines = []
+    cur = ""
+    for w in words:
+        cand = (cur + " " + w).strip() if cur else w
+        try:
+            need = _text_length(cand, fontname, fontsize)
+        except Exception:
+            need = len(cand) * fontsize * 0.5
+        if not cur or need <= max_width:
+            cur = cand
+        else:
+            lines.append(cur)
+            cur = w
+            # single very long word wider than column: put it alone, it will
+            # be shrunk by the font-size loop rather than overflowing.
+    if cur:
+        lines.append(cur)
+    return lines if lines else [" "]
+
+
 def extract_text_blocks(input_path: str) -> List[dict]:
     """
     Returns every piece of text in the PDF with its exact position, so a
     client can show it as a tappable/editable overlay on top of the page.
     Each block is one "span" (a run of text with uniform font/size/color) -
     this is finer-grained than a whole paragraph, which keeps edits precise.
+
+    Extra fields (block_no / line_no / line_bbox / block_bbox / flags /
+    origin / page_width / page_height) let apply_text_edits() rewrite the
+    whole paragraph with the original width + alignment preserved, instead
+    of drawing one endless single line that shoots past the right margin.
     """
     doc = fitz.open(input_path)
     blocks = []
     block_id = 0
     for page_index, page in enumerate(doc):
+        pw, ph = page.rect.width, page.rect.height
         raw = page.get_text("dict")
-        for block in raw["blocks"]:
-            if block.get("type") != 0:  # skip images/non-text blocks
-                continue
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    text = span["text"]
+        text_blocks = [b for b in raw.get("blocks", []) if b.get("type") == 0]
+        for bno, block in enumerate(text_blocks):
+            bx0, by0, bx1, by1 = block.get("bbox", [0, 0, 0, 0])
+            lines = block.get("lines", [])
+            for lno, line in enumerate(lines):
+                lx0, ly0, lx1, ly1 = line.get("bbox", [0, 0, 0, 0])
+                for span in line.get("spans", []):
+                    text = span.get("text", "")
                     if not text.strip():
                         continue
-                    x0, y0, x1, y1 = span["bbox"]
+                    x0, y0, x1, y1 = span.get("bbox", [lx0, ly0, lx1, ly1])
                     color_int = span.get("color", 0)
+                    try:
+                        c = int(color_int)
+                    except Exception:
+                        c = 0
+                    origin = span.get("origin", [x0, y1])
                     blocks.append({
                         "id": block_id,
                         "page": page_index,
                         "text": text,
-                        "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
-                        "font_size": round(span.get("size", 12), 1),
+                        "bbox": [round(float(x0), 2), round(float(y0), 2),
+                                 round(float(x1), 2), round(float(y1), 2)],
+                        "font_size": round(float(span.get("size", 12)), 1),
                         "font_name": span.get("font", "helv"),
                         "color_rgb": [
-                            (color_int >> 16) & 255,
-                            (color_int >> 8) & 255,
-                            color_int & 255,
+                            (c >> 16) & 255,
+                            (c >> 8) & 255,
+                            c & 255,
                         ],
+                        "block_no": bno,
+                        "line_no": lno,
+                        "line_bbox": [round(float(lx0), 2), round(float(ly0), 2),
+                                      round(float(lx1), 2), round(float(ly1), 2)],
+                        "block_bbox": [round(float(bx0), 2), round(float(by0), 2),
+                                       round(float(bx1), 2), round(float(by1), 2)],
+                        "flags": int(span.get("flags", 0)),
+                        "origin": [round(float(origin[0]), 2), round(float(origin[1]), 2)],
+                        "page_width": round(float(pw), 2),
+                        "page_height": round(float(ph), 2),
                     })
                     block_id += 1
     doc.close()
     return blocks
 
 
+def _rects_overlap(a: List[float], b: List[float]) -> float:
+    """Intersection-over-min-area of two [x0,y0,x1,y1] rects (0..1)."""
+    try:
+        ix0 = max(a[0], b[0])
+        iy0 = max(a[1], b[1])
+        ix1 = min(a[2], b[2])
+        iy1 = min(a[3], b[3])
+        if ix1 <= ix0 or iy1 <= iy0:
+            return 0.0
+        inter = (ix1 - ix0) * (iy1 - iy0)
+        area_a = max(1.0, (a[2] - a[0]) * (a[3] - a[1]))
+        area_b = max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+        return inter / min(area_a, area_b)
+    except Exception:
+        return 0.0
+
+
+def _insert_textbox_safe(page, rect, text, fontsize, fontname, color, align):
+    """insert_textbox with fontname fallback. Returns rect-code or -1."""
+    if not text or not text.strip():
+        text = " "
+    try:
+        return page.insert_textbox(rect, text, fontsize=fontsize,
+                                   fontname=fontname, color=color, align=align)
+    except Exception:
+        try:
+            return page.insert_textbox(rect, text, fontsize=fontsize,
+                                       color=color, align=align)
+        except Exception:
+            return -1
+
+
 def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> None:
     """
     edits: list of dicts, each shaped like one item from extract_text_blocks
     but with "new_text" instead of/alongside "text":
-        {"page": 0, "bbox": [x0,y0,x1,y1], "new_text": "...", "font_size": 12}
-    For every edit: the original text's area is redacted (erased) and the
-    new text is drawn in its place, on the correct page.
+        {"page":0,"bbox":[x0,y0,x1,y1],"new_text":"Hello","font_size":14,
+         "color_rgb":[0,0,0],"id":12 (optional, preferred)}
+
+    Page-property-preserving behaviour:
+      * x0/x1 (left + right margins) are NEVER expanded. Only height may
+        grow downward into free space, capped before the next paragraph.
+      * Justified body keeps its look WITHOUT the old bug: full lines are
+        written justified, the last (usually short) line is written
+        left-aligned (or centered if the block was centered). This is what
+        stops "ukygyuy 8yguy 8g ..." from stretching across the page.
+      * Font family / bold / italic / size / color carried from source.
+      * If every edited line still fits its original line width, lines are
+        redrawn 1:1 in their original rects (pixel-faithful, no reflow).
+        Reflow only kicks in on real overflow.
     """
     doc = fitz.open(input_path)
 
-    # Group edits by page so redactions on a page are all applied together
-    edits_by_page: dict = {}
-    for edit in edits:
-        edits_by_page.setdefault(edit["page"], []).append(edit)
-
-    for page_index, page_edits in edits_by_page.items():
-        if page_index < 0 or page_index >= len(doc):
+    edits_by_id = {}
+    bbox_edits = []
+    for e in (edits or []):
+        try:
+            page_no = int(e.get("page", 0))
+        except Exception:
             continue
-        page = doc[page_index]
+        new_text = e.get("new_text", e.get("text", ""))
+        if new_text is None:
+            new_text = ""
+        e["_page"] = page_no
+        e["_new_text"] = str(new_text)
+        if "id" in e and e["id"] is not None:
+            try:
+                edits_by_id[(page_no, int(e["id"]))] = e
+            except Exception:
+                bbox_edits.append(e)
+        else:
+            bbox_edits.append(e)
 
-        # Step 1: mark the original text areas for removal
-        for edit in page_edits:
-            rect = fitz.Rect(edit["bbox"])
-            page.add_redact_annot(rect, fill=(1, 1, 1))
-        page.apply_redactions()
+    for page_index, page in enumerate(doc):
+        pw, ph = page.rect.width, page.rect.height
+        raw = page.get_text("dict")
+        text_blocks = [b for b in raw.get("blocks", []) if b.get("type") == 0]
 
-        # Step 2: draw the new text into the same positions
-        for edit in page_edits:
-            x0, y0, x1, y1 = edit["bbox"]
-            font_size = edit.get("font_size", 12)
-            color_rgb = edit.get("color_rgb", [0, 0, 0])
-            color = tuple(c / 255 for c in color_rgb)
-            baseline_y = y1 - (font_size * 0.2)
-            page.insert_text(
-                (x0, baseline_y),
-                edit["new_text"],
-                fontsize=font_size,
-                color=color,
-            )
+        # global span ids must match extract_text_blocks() ordering
+        gid = 0
+        for pi in range(page_index):
+            try:
+                praw = doc[pi].get_text("dict")
+                for bb in praw.get("blocks", []):
+                    if bb.get("type") != 0:
+                        continue
+                    for ll in bb.get("lines", []):
+                        for ss in ll.get("spans", []):
+                            if (ss.get("text", "") or "").strip():
+                                gid += 1
+            except Exception:
+                pass
 
-    doc.save(output_path)
+        page_spans = []  # (gid, bno, lno, span, line, block)
+        for bno, block in enumerate(text_blocks):
+            for lno, line in enumerate(block.get("lines", [])):
+                for span in line.get("spans", []):
+                    if not (span.get("text", "") or "").strip():
+                        continue
+                    page_spans.append((gid, bno, lno, span, line, block))
+                    gid += 1
+
+        def span_matches(gid_, span_):
+            if (page_index, gid_) in edits_by_id:
+                return edits_by_id[(page_index, gid_)]
+            sb = span_.get("bbox")
+            if not sb:
+                return None
+            for be in bbox_edits:
+                if be["_page"] != page_index:
+                    continue
+                ebb = be.get("bbox")
+                if not ebb or len(ebb) != 4:
+                    continue
+                try:
+                    if _rects_overlap([float(v) for v in sb],
+                                      [float(v) for v in ebb]) > 0.4:
+                        return be
+                except Exception:
+                    continue
+            return None
+
+        affected = {}
+        for gid_, bno, lno, span, line, block in page_spans:
+            m = span_matches(gid_, span)
+            if m is not None:
+                affected.setdefault(bno, {"block": block, "hits": {}})
+                affected[bno]["hits"][gid_] = m
+
+        if not affected:
+            continue
+
+        sorted_bnos = sorted(affected.keys(),
+                             key=lambda b: affected[b]["block"].get("bbox", [0, 0, 0, 0])[1])
+
+        # ---- Phase 1: redact whole affected paragraphs ----
+        block_rects = {}
+        for bno in sorted_bnos:
+            block = affected[bno]["block"]
+            bx0, by0, bx1, by1 = block.get("bbox", [0, 0, 0, 0])
+            rect = fitz.Rect(float(bx0), float(by0), float(bx1), float(by1))
+            try:
+                page.add_redact_annot(
+                    fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, rect.y1 + 1),
+                    fill=(1, 1, 1))
+            except Exception:
+                pass
+            block_rects[bno] = rect
+        try:
+            try:
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            except Exception:
+                page.apply_redactions()
+        except Exception:
+            pass
+
+        block_tops = sorted([(b.get("bbox", [0, 0, 0, 0])[1], bi)
+                             for bi, b in enumerate(text_blocks)])
+
+        # ---- Phase 2: rewrite each paragraph inside ORIGINAL x0..x1 ----
+        for bno in sorted_bnos:
+            info = affected[bno]
+            block = info["block"]
+            hits = info["hits"]
+            rect = block_rects[bno]
+            lines = block.get("lines", [])
+            if not lines:
+                continue
+
+            # new text per original line (gap-aware space join)
+            new_line_texts = []
+            line_origins = []
+            for line in lines:
+                spans_sorted = sorted(line.get("spans", []),
+                                      key=lambda s: s.get("bbox", [0, 0, 0, 0])[0])
+                parts = []
+                prev_x1 = None
+                for sp in spans_sorted:
+                    if not (sp.get("text", "") or "").strip():
+                        continue
+                    sgid = None
+                    for g2, b2, _l2, s2, _ln2, _b2 in page_spans:
+                        if b2 == bno and s2 is sp:
+                            sgid = g2
+                            break
+                    orig = sp.get("text", "")
+                    repl = orig
+                    if sgid is not None and sgid in hits:
+                        repl = hits[sgid]["_new_text"]
+                    else:
+                        m2 = span_matches(sgid if sgid is not None else -1, sp)
+                        if m2 is not None:
+                            repl = m2["_new_text"]
+                    if prev_x1 is not None and parts:
+                        try:
+                            gap = float(sp.get("bbox", [0, 0, 0, 0])[0]) - float(prev_x1)
+                            fsz = float(sp.get("size", 12))
+                            if (gap > fsz * 0.18
+                                    and not parts[-1].endswith((" ", "\n", "\t"))
+                                    and not str(repl).startswith(" ")):
+                                parts.append(" ")
+                        except Exception:
+                            pass
+                    parts.append(str(repl))
+                    try:
+                        prev_x1 = float(sp.get("bbox", [0, 0, 0, 0])[2])
+                    except Exception:
+                        prev_x1 = None
+                new_line_texts.append("".join(parts))
+                try:
+                    sp0 = spans_sorted[0] if spans_sorted else {}
+                    o = sp0.get("origin", None)
+                    line_origins.append(o)
+                except Exception:
+                    line_origins.append(None)
+
+            # dominant style for the paragraph
+            all_spans = []
+            for line in lines:
+                all_spans.extend(line.get("spans", []))
+            sizes = sorted([float(s.get("size", 12)) for s in all_spans if (s.get("text", "") or "").strip()])
+            dom_size = sizes[len(sizes) // 2] if sizes else 12.0
+            ov = []
+            for g2, b2, _l2, _s2, _ln2, _b2 in page_spans:
+                if b2 == bno and g2 in hits:
+                    try:
+                        ov.append(float(hits[g2].get("font_size", dom_size)))
+                    except Exception:
+                        pass
+            if ov:
+                dom_size = sorted(ov)[len(ov) // 2]
+
+            font_votes = {}
+            color_votes = {}
+            for s in all_spans:
+                if not (s.get("text", "") or "").strip():
+                    continue
+                key = (s.get("font", "helv"), int(s.get("flags", 0)))
+                font_votes[key] = font_votes.get(key, 0) + 1
+                try:
+                    ci = int(s.get("color", 0))
+                except Exception:
+                    ci = 0
+                color_votes[ci] = color_votes.get(ci, 0) + 1
+            dom_font, dom_flags = max(font_votes.items(), key=lambda kv: kv[1])[0] if font_votes else ("helv", 0)
+            dom_color_int = max(color_votes.items(), key=lambda kv: kv[1])[0] if color_votes else 0
+            for g2, b2, _l2, _s2, _ln2, _b2 in page_spans:
+                if b2 == bno and g2 in hits:
+                    crgb = hits[g2].get("color_rgb")
+                    if isinstance(crgb, (list, tuple)) and len(crgb) == 3:
+                        try:
+                            dom_color_int = ((int(crgb[0]) & 255) << 16) | ((int(crgb[1]) & 255) << 8) | (int(crgb[2]) & 255)
+                        except Exception:
+                            pass
+                        break
+            fontname = _map_font(dom_font, dom_flags)
+            color = ((dom_color_int >> 16 & 255) / 255,
+                     (dom_color_int >> 8 & 255) / 255,
+                     (dom_color_int & 255) / 255)
+
+            try:
+                line_bboxes_f = [list(map(float, ln.get("bbox", [0, 0, 0, 0]))) for ln in lines]
+            except Exception:
+                line_bboxes_f = []
+            orig_align = _detect_block_align(line_bboxes_f, pw)
+
+            try:
+                cur_top = float(block.get("bbox", [0, 0, 0, 0])[1])
+                following = [t for t, _ in block_tops if t > cur_top + 1]
+                cap_y1 = min(ph - 20, min(following) - 2) if following else ph - 20
+            except Exception:
+                cap_y1 = ph - 20
+
+            fontsize = max(6.0, min(float(dom_size) if dom_size else 12.0, 72.0))
+            block_w = max(20.0, float(rect.x1 - rect.x0))
+
+            # Fast path 1: single line that still fits -> exact origin write.
+            if len(lines) == 1:
+                single = new_line_texts[0] if new_line_texts else " "
+                if _text_length(single, fontname, fontsize) <= block_w + 2 and line_origins and line_origins[0]:
+                    try:
+                        page.insert_text(fitz.Point(float(line_origins[0][0]), float(line_origins[0][1])),
+                                         single, fontsize=fontsize,
+                                         fontname=fontname, color=color)
+                        continue
+                    except Exception:
+                        try:
+                            page.insert_text(fitz.Point(float(line_origins[0][0]), float(line_origins[0][1])),
+                                             single, fontsize=fontsize, color=color)
+                            continue
+                        except Exception:
+                            pass
+
+            # Fast path 2: every line still fits its own width -> redraw 1:1.
+            # This keeps untouched line breaks exactly as uploaded.
+            per_line_ok = True
+            for li, ln in enumerate(lines):
+                try:
+                    lx0, _ly0, lx1, _ly1 = list(map(float, ln.get("bbox", [0, 0, 0, 0])))
+                    avail = max(10.0, lx1 - lx0)
+                except Exception:
+                    avail = block_w
+                if _text_length(new_line_texts[li] if li < len(new_line_texts) else "", fontname, fontsize) > avail + 3:
+                    per_line_ok = False
+                    break
+            if per_line_ok and len(lines) <= 12:
+                for li, ln in enumerate(lines):
+                    try:
+                        lx0, ly0, lx1, ly1 = list(map(float, ln.get("bbox", [0, 0, 0, 0])))
+                    except Exception:
+                        continue
+                    txt = new_line_texts[li] if li < len(new_line_texts) else ""
+                    if not txt.strip():
+                        continue
+                    # short trailing line of a justified block must NOT be justified
+                    if orig_align == 3:
+                        try:
+                            fill = (float(lx1) - float(lx0)) / block_w
+                        except Exception:
+                            fill = 1.0
+                        la = 3 if (li < len(lines) - 1 and fill > 0.85) else 0
+                    elif orig_align == 1:
+                        la = 1
+                    elif orig_align == 2:
+                        la = 2
+                    else:
+                        la = 0
+                    lr = fitz.Rect(float(rect.x0), float(ly0), float(rect.x1), float(ly1) + 2)
+                    _insert_textbox_safe(page, lr, txt, fontsize, fontname, color, la)
+                continue
+
+            # Slow path: real overflow -> reflow words inside ORIGINAL width.
+            # Last line is ALWAYS left (or center), never justified.
+            words = []
+            for t in new_line_texts:
+                words.extend(str(t).split())
+            if not words:
+                continue
+
+            attempt = fontsize
+            done = False
+            for _try in range(14):
+                if _try > 0:
+                    # clear previous partial attempt before retry
+                    try:
+                        page.add_redact_annot(fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, cap_y1 + 1),
+                                              fill=(1, 1, 1))
+                        try:
+                            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+                        except Exception:
+                            page.apply_redactions()
+                    except Exception:
+                        pass
+                flow = _reflow_words(words, fontname, attempt, block_w)
+                line_h = attempt * 1.22
+                need_h = line_h * len(flow)
+                avail_h = max(line_h, cap_y1 - float(rect.y0))
+                if need_h > avail_h + 0.5:
+                    if attempt > 6.5:
+                        attempt = round(attempt - 0.5, 1)
+                        continue
+                    # still too tall at min size: truncate to what fits
+                    max_lines = max(1, int(avail_h // line_h))
+                    flow = flow[:max_lines]
+                cur_y = float(rect.y0)
+                ok_all = True
+                for li, ltxt in enumerate(flow):
+                    is_last = (li == len(flow) - 1)
+                    if orig_align == 1:
+                        la = 1
+                    elif orig_align == 2:
+                        la = 2
+                    elif orig_align == 3:
+                        if is_last:
+                            la = 0
+                        else:
+                            try:
+                                fill = _text_length(ltxt, fontname, attempt) / block_w
+                            except Exception:
+                                fill = 1.0
+                            la = 3 if fill > 0.7 else 0
+                    else:
+                        la = 0
+                    lr = fitz.Rect(float(rect.x0), cur_y, float(rect.x1), cur_y + line_h + 2)
+                    rc = _insert_textbox_safe(page, lr, ltxt, attempt, fontname, color, la)
+                    if rc is None or rc < 0:
+                        ok_all = False
+                        break
+                    cur_y += line_h
+                if ok_all:
+                    done = True
+                    break
+                if attempt > 6.5:
+                    attempt = round(attempt - 0.5, 1)
+                else:
+                    break
+            _ = done
+
+    doc.save(output_path, garbage=4, deflate=True)
     doc.close()
 
 
