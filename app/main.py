@@ -14,6 +14,7 @@ you can test every endpoint from the browser immediately.
 
 import os
 import shutil
+import json
 from typing import List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -229,6 +230,51 @@ async def extract_text(file_id: str = Form(...)):
 
     text = pdf_utils.extract_text(input_path)
     return {"text": text, "char_count": len(text)}
+
+
+# ---------------------------------------------------------------------------
+# TEXT BLOCKS: real text editing (like Acrobat's "Edit Text" tool)
+# ---------------------------------------------------------------------------
+
+@app.post("/extract-text-blocks")
+async def extract_text_blocks(file_id: str = Form(...)):
+    """
+    Returns every text span in the document with its exact page + position,
+    so a client app can render tappable text over the page image and let
+    the user edit each piece individually.
+    """
+    try:
+        input_path = storage.resolve_input(file_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "file_id not found")
+
+    blocks = pdf_utils.extract_text_blocks(input_path)
+    return {"blocks": blocks, "block_count": len(blocks)}
+
+
+@app.post("/apply-edits")
+async def apply_edits(file_id: str = Form(...), edits: str = Form(...)):
+    """
+    edits: a JSON-encoded array, e.g.
+      [{"page":0,"bbox":[100,50,300,70],"new_text":"Hello","font_size":14,
+        "color_rgb":[0,0,0]}]
+    Each item normally comes from a block returned by /extract-text-blocks,
+    with "text" swapped out for "new_text" after the user edits it.
+    """
+    try:
+        input_path = storage.resolve_input(file_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "file_id not found")
+
+    try:
+        parsed_edits = json.loads(edits)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "edits must be valid JSON")
+
+    out_id = storage.new_id()
+    out_path = storage.new_output_path(out_id)
+    pdf_utils.apply_text_edits(input_path, parsed_edits, out_path)
+    return {"output_file_id": out_id, "download_url": f"/download/{out_id}"}
 
 
 @app.post("/ocr")

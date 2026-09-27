@@ -146,6 +146,91 @@ def extract_text(input_path: str) -> str:
     return "\n".join(text)
 
 
+# ---------- TEXT BLOCKS (for real text editing, like Acrobat) ----------
+def extract_text_blocks(input_path: str) -> List[dict]:
+    """
+    Returns every piece of text in the PDF with its exact position, so a
+    client can show it as a tappable/editable overlay on top of the page.
+    Each block is one "span" (a run of text with uniform font/size/color) -
+    this is finer-grained than a whole paragraph, which keeps edits precise.
+    """
+    doc = fitz.open(input_path)
+    blocks = []
+    block_id = 0
+    for page_index, page in enumerate(doc):
+        raw = page.get_text("dict")
+        for block in raw["blocks"]:
+            if block.get("type") != 0:  # skip images/non-text blocks
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    text = span["text"]
+                    if not text.strip():
+                        continue
+                    x0, y0, x1, y1 = span["bbox"]
+                    color_int = span.get("color", 0)
+                    blocks.append({
+                        "id": block_id,
+                        "page": page_index,
+                        "text": text,
+                        "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
+                        "font_size": round(span.get("size", 12), 1),
+                        "font_name": span.get("font", "helv"),
+                        "color_rgb": [
+                            (color_int >> 16) & 255,
+                            (color_int >> 8) & 255,
+                            color_int & 255,
+                        ],
+                    })
+                    block_id += 1
+    doc.close()
+    return blocks
+
+
+def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> None:
+    """
+    edits: list of dicts, each shaped like one item from extract_text_blocks
+    but with "new_text" instead of/alongside "text":
+        {"page": 0, "bbox": [x0,y0,x1,y1], "new_text": "...", "font_size": 12}
+    For every edit: the original text's area is redacted (erased) and the
+    new text is drawn in its place, on the correct page.
+    """
+    doc = fitz.open(input_path)
+
+    # Group edits by page so redactions on a page are all applied together
+    edits_by_page: dict = {}
+    for edit in edits:
+        edits_by_page.setdefault(edit["page"], []).append(edit)
+
+    for page_index, page_edits in edits_by_page.items():
+        if page_index < 0 or page_index >= len(doc):
+            continue
+        page = doc[page_index]
+
+        # Step 1: mark the original text areas for removal
+        for edit in page_edits:
+            rect = fitz.Rect(edit["bbox"])
+            page.add_redact_annot(rect, fill=(1, 1, 1))
+        page.apply_redactions()
+
+        # Step 2: draw the new text into the same positions
+        for edit in page_edits:
+            x0, y0, x1, y1 = edit["bbox"]
+            font_size = edit.get("font_size", 12)
+            color_rgb = edit.get("color_rgb", [0, 0, 0])
+            color = tuple(c / 255 for c in color_rgb)
+            baseline_y = y1 - (font_size * 0.2)
+            page.insert_text(
+                (x0, baseline_y),
+                edit["new_text"],
+                fontsize=font_size,
+                color=color,
+            )
+
+    doc.save(output_path)
+    doc.close()
+
+
 # ---------- PDF -> IMAGES ----------
 def pdf_to_images(input_path: str, output_dir: str, dpi: int = 150) -> List[str]:
     doc = fitz.open(input_path)
