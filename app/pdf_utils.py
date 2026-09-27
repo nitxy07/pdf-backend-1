@@ -631,109 +631,47 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                         except Exception:
                             pass
 
-            # Fast path 2: every line still fits its own width -> redraw 1:1.
-            # This keeps untouched line breaks exactly as uploaded.
-            per_line_ok = True
-            for li, ln in enumerate(lines):
-                try:
-                    lx0, _ly0, lx1, _ly1 = list(map(float, ln.get("bbox", [0, 0, 0, 0])))
-                    avail = max(10.0, lx1 - lx0)
-                except Exception:
-                    avail = block_w
-                if _text_length(new_line_texts[li] if li < len(new_line_texts) else "", fontname, fontsize) > avail + 3:
-                    per_line_ok = False
-                    break
-            if per_line_ok and len(lines) <= 12:
-                for li, ln in enumerate(lines):
-                    try:
-                        lx0, ly0, lx1, ly1 = list(map(float, ln.get("bbox", [0, 0, 0, 0])))
-                    except Exception:
-                        continue
-                    txt = new_line_texts[li] if li < len(new_line_texts) else ""
-                    if not txt.strip():
-                        continue
-                    # short trailing line of a justified block must NOT be justified
-                    if orig_align == 3:
-                        try:
-                            fill = (float(lx1) - float(lx0)) / block_w
-                        except Exception:
-                            fill = 1.0
-                        la = 3 if (li < len(lines) - 1 and fill > 0.85) else 0
-                    elif orig_align == 1:
-                        la = 1
-                    elif orig_align == 2:
-                        la = 2
-                    else:
-                        la = 0
-                    lr = fitz.Rect(float(rect.x0), float(ly0), float(rect.x1), float(ly1) + 2)
-                    _insert_textbox_safe(page, lr, txt, fontsize, fontname, color, la)
+            # Unified rewrite: give PyMuPDF the WHOLE paragraph text in one
+            # insert_textbox() call and let it wrap AND justify together.
+            # This is the key fix: calling insert_textbox once per
+            # already-split line (the old approach) makes PyMuPDF think
+            # each line is "already fitting" and it never stretches word
+            # spacing - align=3 is silently ignored on a single fitting
+            # line. Justify only works when PyMuPDF does its own wrapping
+            # across multiple lines inside one call.
+            full_text = " ".join(t for t in new_line_texts if t.strip())
+            if not full_text.strip():
                 continue
 
-            # Slow path: real overflow -> reflow words inside ORIGINAL width.
-            # Last line is ALWAYS left (or center), never justified.
-            words = []
-            for t in new_line_texts:
-                words.extend(str(t).split())
-            if not words:
-                continue
-
+            orig_bottom = float(rect.y1)
             attempt = fontsize
             done = False
-            for _try in range(14):
+            for _try in range(10):
                 if _try > 0:
-                    # clear previous partial attempt before retry
+                    # widen the erased area before retrying at a new size
                     try:
-                        page.add_redact_annot(fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, cap_y1 + 1),
-                                              fill=(1, 1, 1))
+                        page.add_redact_annot(
+                            fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, cap_y1 + 1),
+                            fill=(1, 1, 1))
                         try:
                             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
                         except Exception:
                             page.apply_redactions()
                     except Exception:
                         pass
-                flow = _reflow_words(words, fontname, attempt, block_w)
-                line_h = attempt * 1.22
-                need_h = line_h * len(flow)
-                avail_h = max(line_h, cap_y1 - float(rect.y0))
-                if need_h > avail_h + 0.5:
-                    if attempt > 6.5:
-                        attempt = round(attempt - 0.5, 1)
-                        continue
-                    # still too tall at min size: truncate to what fits
-                    max_lines = max(1, int(avail_h // line_h))
-                    flow = flow[:max_lines]
-                cur_y = float(rect.y0)
-                ok_all = True
-                for li, ltxt in enumerate(flow):
-                    is_last = (li == len(flow) - 1)
-                    if orig_align == 1:
-                        la = 1
-                    elif orig_align == 2:
-                        la = 2
-                    elif orig_align == 3:
-                        if is_last:
-                            la = 0
-                        else:
-                            try:
-                                fill = _text_length(ltxt, fontname, attempt) / block_w
-                            except Exception:
-                                fill = 1.0
-                            la = 3 if fill > 0.7 else 0
-                    else:
-                        la = 0
-                    lr = fitz.Rect(float(rect.x0), cur_y, float(rect.x1), cur_y + line_h + 2)
-                    rc = _insert_textbox_safe(page, lr, ltxt, attempt, fontname, color, la)
-                    if rc is None or rc < 0:
-                        ok_all = False
-                        break
-                    cur_y += line_h
-                if ok_all:
+
+                # First try within the paragraph's original height; only
+                # grow downward into free space if that's not enough.
+                target_bottom = orig_bottom if _try == 0 else cap_y1
+                write_rect = fitz.Rect(float(rect.x0), float(rect.y0),
+                                       float(rect.x1), float(target_bottom))
+                rc = _insert_textbox_safe(page, write_rect, full_text,
+                                          attempt, fontname, color, orig_align)
+                if rc is not None and rc >= 0:
                     done = True
                     break
                 if attempt > 6.5:
                     attempt = round(attempt - 0.5, 1)
-                else:
-                    break
             _ = done
 
     doc.save(output_path, garbage=4, deflate=True)
