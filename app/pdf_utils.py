@@ -678,6 +678,199 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
     doc.close()
 
 
+# ---------- IMAGES & STAMPS (move / drag) ----------
+
+def _rect_iou(a, b) -> float:
+    """Intersection-over-union of two rects (any 4-number sequences)."""
+    try:
+        ra, rb = fitz.Rect(a), fitz.Rect(b)
+        inter = ra & rb
+        if inter.is_empty:
+            return 0.0
+        ia = inter.width * inter.height
+        ua = ra.width * ra.height + rb.width * rb.height - ia
+        return ia / ua if ua > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _stamp_annots(page):
+    """All stamp annotations on a page (empty list if none)."""
+    out = []
+    try:
+        for annot in (page.annots() or []):
+            if annot.type[0] == fitz.PDF_ANNOT_STAMP:
+                out.append(annot)
+    except Exception:
+        pass
+    return out
+
+
+def extract_page_images(input_path: str) -> List[dict]:
+    """
+    Lists every movable non-text object: embedded images and stamp
+    annotations, with the exact page position of each.
+
+    kind "image": an image drawn on the page (logo, photo, signature scan..)
+    kind "stamp": a stamp annotation (Approved, Draft, image stamps...)
+    full_page:    True when the object covers ~the whole page (a scanned
+                  page). Clients should not offer to drag those.
+    """
+    doc = fitz.open(input_path)
+    items: List[dict] = []
+    next_id = 0
+    for page_index, page in enumerate(doc):
+        page_area = max(page.rect.width * page.rect.height, 1.0)
+
+        stamps = _stamp_annots(page)
+        stamp_rects = []
+        for annot in stamps:
+            r = fitz.Rect(annot.rect)
+            if r.width < 2 or r.height < 2:
+                continue
+            stamp_rects.append(r)
+            items.append({
+                "id": next_id,
+                "page": page_index,
+                "kind": "stamp",
+                "bbox": [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)],
+                "xref": int(annot.xref),
+                "full_page": (r.width * r.height) > 0.9 * page_area,
+            })
+            next_id += 1
+
+        for info in page.get_image_info(xrefs=True):
+            r = fitz.Rect(info["bbox"])
+            if r.width < 4 or r.height < 4:
+                continue
+            # an image that is just the picture inside a stamp -> skip, the
+            # stamp itself is the draggable object
+            if any(_rect_iou(r, sr) > 0.8 for sr in stamp_rects):
+                continue
+            items.append({
+                "id": next_id,
+                "page": page_index,
+                "kind": "image",
+                "bbox": [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)],
+                "xref": int(info.get("xref", 0) or 0),
+                "full_page": (r.width * r.height) > 0.9 * page_area,
+            })
+            next_id += 1
+    doc.close()
+    return items
+
+
+def apply_image_edits(input_path: str, edits: List[dict], output_path: str) -> None:
+    """
+    Moves (and/or resizes) images and stamps.
+
+    edits: [{"page": 0, "kind": "image"|"stamp",
+             "old_bbox": [x0,y0,x1,y1],   # where it was (from extract_page_images)
+             "new_bbox": [x0,y0,x1,y1]}]  # where it should go
+
+    Objects are matched by POSITION (old_bbox), not by xref/id, because ids
+    change whenever a PDF is re-saved (e.g. after text edits ran first).
+
+    * stamp  -> the annotation's rectangle is simply changed.
+    * image  -> the image is removed from its old place (only that picture,
+                text and everything else stay untouched) and re-drawn at the
+                new rectangle with its original pixels + transparency.
+                If the same picture is used several times, only the one you
+                moved is moved; the others stay where they were.
+    """
+    doc = fitz.open(input_path)
+
+    stamp_edits, image_edits = [], []
+    for e in (edits or []):
+        try:
+            page_no = int(e.get("page", 0))
+            old_bbox = [float(v) for v in e["old_bbox"]]
+            new_bbox = [float(v) for v in e["new_bbox"]]
+            if len(old_bbox) != 4 or len(new_bbox) != 4:
+                continue
+            if page_no < 0 or page_no >= len(doc):
+                continue
+        except Exception:
+            continue
+        item = {"page": page_no, "old": old_bbox, "new": new_bbox}
+        (stamp_edits if e.get("kind") == "stamp" else image_edits).append(item)
+
+    # ---- stamps: just change the rectangle ----
+    for e in stamp_edits:
+        page = doc[e["page"]]
+        best, best_iou = None, 0.4
+        for annot in _stamp_annots(page):
+            iou = _rect_iou(annot.rect, e["old"])
+            if iou > best_iou:
+                best, best_iou = annot, iou
+        if best is not None:
+            best.set_rect(fitz.Rect(e["new"]))
+            best.update()
+
+    # ---- images: match each move to a real image on the page ----
+    by_xref: dict = {}
+    for e in image_edits:
+        page = doc[e["page"]]
+        best, best_iou = None, 0.4
+        for info in page.get_image_info(xrefs=True):
+            if not info.get("xref"):
+                continue
+            iou = _rect_iou(info["bbox"], e["old"])
+            if iou > best_iou:
+                best, best_iou = info, iou
+        if best is None:
+            continue
+        by_xref.setdefault(int(best["xref"]), []).append(
+            (e["page"], fitz.Rect(best["bbox"]), fitz.Rect(e["new"])))
+
+    for xref, moves in by_xref.items():
+        # every place this picture is drawn anywhere in the document
+        placements = []
+        for pi, pg in enumerate(doc):
+            try:
+                for r in pg.get_image_rects(xref):
+                    placements.append((pi, fitz.Rect(r)))
+            except Exception:
+                pass
+        if not placements:
+            continue
+
+        # grab the original pixels (+ soft mask for transparency) first
+        ext = doc.extract_image(xref)
+        if not ext or not ext.get("image"):
+            continue
+        kwargs = {"stream": ext["image"]}
+        smask = ext.get("smask", 0)
+        if smask:
+            try:
+                mask_ext = doc.extract_image(smask)
+                if mask_ext and mask_ext.get("image"):
+                    kwargs["mask"] = mask_ext["image"]
+            except Exception:
+                pass
+
+        # remove the old picture (replaced by a 1x1 transparent pixel)
+        doc[moves[0][0]].delete_image(xref)
+
+        new_xref = 0
+        for pi, r in placements:
+            target = r
+            for mpi, orect, nrect in moves:
+                if mpi == pi and _rect_iou(orect, r) > 0.9:
+                    target = nrect
+                    break
+            pg = doc[pi]
+            if new_xref:
+                pg.insert_image(target, xref=new_xref,
+                                keep_proportion=False, overlay=True)
+            else:
+                new_xref = pg.insert_image(target, keep_proportion=False,
+                                           overlay=True, **kwargs)
+
+    doc.save(output_path, garbage=4, deflate=True)
+    doc.close()
+
+
 # ---------- PDF -> IMAGES ----------
 def pdf_to_images(input_path: str, output_dir: str, dpi: int = 150) -> List[str]:
     doc = fitz.open(input_path)
