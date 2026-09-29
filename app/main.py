@@ -277,6 +277,49 @@ async def apply_edits(file_id: str = Form(...), edits: str = Form(...)):
     return {"output_file_id": out_id, "download_url": f"/download/{out_id}"}
 
 
+# ---------------------------------------------------------------------------
+# IMAGES & STAMPS: list them, then move / drag them
+# ---------------------------------------------------------------------------
+
+@app.post("/extract-images")
+async def extract_images(file_id: str = Form(...)):
+    """
+    Lists every image and stamp on every page with its exact position, so a
+    client app can let the user drag them around.
+    """
+    try:
+        input_path = storage.resolve_input(file_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "file_id not found")
+
+    images = pdf_utils.extract_page_images(input_path)
+    return {"images": images, "image_count": len(images)}
+
+
+@app.post("/apply-image-edits")
+async def apply_image_edits(file_id: str = Form(...), edits: str = Form(...)):
+    """
+    edits: JSON array, e.g.
+      [{"page":0,"kind":"image","old_bbox":[72,100,172,160],
+        "new_bbox":[300,400,400,460]}]
+    Moves each image/stamp from old_bbox to new_bbox in a new PDF.
+    """
+    try:
+        input_path = storage.resolve_input(file_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "file_id not found")
+
+    try:
+        parsed_edits = json.loads(edits)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "edits must be valid JSON")
+
+    out_id = storage.new_id()
+    out_path = storage.new_output_path(out_id)
+    pdf_utils.apply_image_edits(input_path, parsed_edits, out_path)
+    return {"output_file_id": out_id, "download_url": f"/download/{out_id}"}
+
+
 @app.post("/ocr")
 async def ocr(file_id: str = Form(...), language: str = Form("eng")):
     """
