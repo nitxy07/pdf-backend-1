@@ -473,10 +473,68 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
         sorted_bnos = sorted(affected.keys(),
                              key=lambda b: affected[b]["block"].get("bbox", [0, 0, 0, 0])[1])
 
-        # ---- Phase 1: redact whole affected paragraphs ----
+        # Classify each affected block: a real paragraph has lines stacked
+        # vertically (non-overlapping y-ranges). A table row often comes
+        # through as one PyMuPDF "block" whose "lines" are actually
+        # side-by-side CELLS (label, value) that happen to share the same
+        # y-range. Those must NEVER be joined into one wrapped paragraph -
+        # editing the value would swallow the label (and vice versa),
+        # exactly like a spreadsheet cell overflowing into its neighbour.
+        def _is_row_like(block) -> bool:
+            lns = block.get("lines", [])
+            for i in range(len(lns)):
+                for j in range(i + 1, len(lns)):
+                    try:
+                        y0a, y1a = float(lns[i]["bbox"][1]), float(lns[i]["bbox"][3])
+                        y0b, y1b = float(lns[j]["bbox"][1]), float(lns[j]["bbox"][3])
+                    except Exception:
+                        continue
+                    inter = min(y1a, y1b) - max(y0a, y0b)
+                    min_h = min(y1a - y0a, y1b - y0b)
+                    if min_h > 0 and inter > 0.4 * min_h:
+                        return True
+            return False
+
+        block_is_rowlike = {bno: _is_row_like(affected[bno]["block"]) for bno in sorted_bnos}
+
+        # A horizontal cap per row-like line: don't let a long replacement
+        # spill into the next table column. Uses any OTHER block on the
+        # page that starts further right and shares this line's y-range.
+        def _row_right_cap(line_bbox) -> float:
+            ly0, ly1 = float(line_bbox[1]), float(line_bbox[3])
+            lx0 = float(line_bbox[0])
+            best = pw - 20.0
+            for other in text_blocks:
+                obx0, oby0, obx1, oby1 = other.get("bbox", [0, 0, 0, 0])
+                if float(obx0) <= lx0 + 1:
+                    continue
+                inter = min(ly1, float(oby1)) - max(ly0, float(oby0))
+                if inter > 0.3 * (ly1 - ly0):
+                    best = min(best, float(obx0) - 6.0)
+            return best
+
+        # ---- Phase 1: redact. Whole box for real paragraphs; ONLY the
+        # specific edited line(s) for row-like (table) blocks. ----
         block_rects = {}
         for bno in sorted_bnos:
             block = affected[bno]["block"]
+            if block_is_rowlike[bno]:
+                hits = affected[bno]["hits"]
+                for line in block.get("lines", []):
+                    line_gids = []
+                    for g2, b2, _l2, s2, ln2, _blk2 in page_spans:
+                        if b2 == bno and ln2 is line:
+                            line_gids.append(g2)
+                    if not any(g in hits for g in line_gids):
+                        continue  # untouched cell in this row - leave it alone
+                    lx0, ly0, lx1, ly1 = line.get("bbox", [0, 0, 0, 0])
+                    try:
+                        page.add_redact_annot(
+                            fitz.Rect(float(lx0) - 1, float(ly0) - 1, float(lx1) + 1, float(ly1) + 1),
+                            fill=(1, 1, 1))
+                    except Exception:
+                        pass
+                continue
             bx0, by0, bx1, by1 = block.get("bbox", [0, 0, 0, 0])
             rect = fitz.Rect(float(bx0), float(by0), float(bx1), float(by1))
             try:
@@ -497,8 +555,89 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
         block_tops = sorted([(b.get("bbox", [0, 0, 0, 0])[1], bi)
                              for bi, b in enumerate(text_blocks)])
 
-        # ---- Phase 2: rewrite each paragraph inside ORIGINAL x0..x1 ----
+        # ---- Phase 2a: row-like blocks - rewrite ONLY the edited cell(s),
+        # each independently, never touching its neighbour. ----
         for bno in sorted_bnos:
+            if not block_is_rowlike[bno]:
+                continue
+            block = affected[bno]["block"]
+            hits = affected[bno]["hits"]
+            for line in block.get("lines", []):
+                spans_sorted = sorted(line.get("spans", []),
+                                      key=lambda s: s.get("bbox", [0, 0, 0, 0])[0])
+                line_gid_map = {}
+                for g2, b2, _l2, s2, ln2, _blk2 in page_spans:
+                    if b2 == bno and ln2 is line:
+                        line_gid_map[id(s2)] = g2
+                edit_for_line = None
+                for sp in spans_sorted:
+                    g = line_gid_map.get(id(sp))
+                    if g is not None and g in hits:
+                        edit_for_line = hits[g]
+                        break
+                if edit_for_line is None:
+                    continue  # this cell wasn't edited - leave completely untouched
+
+                lx0, ly0, lx1, ly1 = [float(v) for v in line.get("bbox", [0, 0, 0, 0])]
+                new_text = str(edit_for_line.get("_new_text", ""))
+                fsize = float(edit_for_line.get("font_size", spans_sorted[0].get("size", 11) if spans_sorted else 11))
+                fsize = max(6.0, min(fsize, 72.0))
+                crgb = edit_for_line.get("color_rgb")
+                if isinstance(crgb, (list, tuple)) and len(crgb) == 3:
+                    color = (crgb[0] / 255, crgb[1] / 255, crgb[2] / 255)
+                else:
+                    color = (0.0, 0.0, 0.0)
+                src_font = spans_sorted[0].get("font", "helv") if spans_sorted else "helv"
+                src_flags = int(spans_sorted[0].get("flags", 0)) if spans_sorted else 0
+                fontname = _map_font(src_font, src_flags)
+                origin = spans_sorted[0].get("origin", [lx0, ly1]) if spans_sorted else [lx0, ly1]
+
+                # How far this cell can grow right before hitting the next
+                # table column - a longer value should spill into that free
+                # space, never wrap onto a second line unnecessarily (a
+                # table row usually has no extra vertical room to spare;
+                # insert_textbox() also needs more line-height padding than
+                # a tight table row provides, even for one line, so a plain
+                # single-line insert_text() is used whenever it fits at all).
+                cap_x1 = _row_right_cap([lx0, ly0, lx1, ly1])
+                available_width = max(lx1 - lx0, cap_x1 - lx0)
+                needed = _text_length(new_text, fontname, fsize)
+
+                if needed <= available_width + 2:
+                    try:
+                        page.insert_text(fitz.Point(float(origin[0]), float(origin[1])),
+                                         new_text, fontsize=fsize, fontname=fontname, color=color)
+                    except Exception:
+                        page.insert_text(fitz.Point(float(origin[0]), float(origin[1])),
+                                         new_text, fontsize=fsize, color=color)
+                    continue
+
+                # Genuinely too long even for the widened cell: wrap onto
+                # extra lines by hand (not insert_textbox - see note above)
+                # so line spacing stays tight enough to fit a table row.
+                words = new_text.split()
+                flow = _reflow_words(words, fontname, fsize, available_width) if words else [new_text]
+                line_h = fsize * 1.15
+                try:
+                    following = [t for t, _ in block_tops if t > ly0 + 1]
+                    cap_y1 = min(ph - 20, min(following) - 2) if following else ph - 20
+                except Exception:
+                    cap_y1 = ph - 20
+                max_lines = max(1, int((cap_y1 - float(origin[1])) // line_h) + 1)
+                baseline_y = float(origin[1])
+                for ltxt in flow[:max_lines]:
+                    try:
+                        page.insert_text(fitz.Point(lx0, baseline_y), ltxt,
+                                         fontsize=fsize, fontname=fontname, color=color)
+                    except Exception:
+                        page.insert_text(fitz.Point(lx0, baseline_y), ltxt,
+                                         fontsize=fsize, color=color)
+                    baseline_y += line_h
+
+        # ---- Phase 2b: real paragraphs - rewrite inside ORIGINAL x0..x1 ----
+        for bno in sorted_bnos:
+            if block_is_rowlike[bno]:
+                continue  # already handled in Phase 2a
             info = affected[bno]
             block = info["block"]
             hits = info["hits"]
