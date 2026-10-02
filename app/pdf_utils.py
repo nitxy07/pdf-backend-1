@@ -515,7 +515,15 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
 
         # ---- Phase 1: redact. Whole box for real paragraphs; ONLY the
         # specific edited line(s) for row-like (table) blocks. ----
+        # Redaction annotations in PyMuPDF can leave a faint boundary of
+        # their own at the rectangle's edge (visible as a thin stray line
+        # right where old text used to be), independent of fill colour or
+        # cross_out. To avoid that entirely: redact with NO fill (its only
+        # job is to strip the underlying text), collect every rect, then
+        # paint our own plain white boxes with draw_rect() afterwards -
+        # fully separate from the redaction annotation's own appearance.
         block_rects = {}
+        white_rects: List["fitz.Rect"] = []
         for bno in sorted_bnos:
             block = affected[bno]["block"]
             if block_is_rowlike[bno]:
@@ -528,21 +536,21 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                     if not any(g in hits for g in line_gids):
                         continue  # untouched cell in this row - leave it alone
                     lx0, ly0, lx1, ly1 = line.get("bbox", [0, 0, 0, 0])
+                    r = fitz.Rect(float(lx0) - 1, float(ly0) - 1, float(lx1) + 1, float(ly1) + 1)
                     try:
-                        page.add_redact_annot(
-                            fitz.Rect(float(lx0) - 1, float(ly0) - 1, float(lx1) + 1, float(ly1) + 1),
-                            fill=(1, 1, 1))
+                        page.add_redact_annot(r)
                     except Exception:
                         pass
+                    white_rects.append(r)
                 continue
             bx0, by0, bx1, by1 = block.get("bbox", [0, 0, 0, 0])
             rect = fitz.Rect(float(bx0), float(by0), float(bx1), float(by1))
+            r = fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, rect.y1 + 1)
             try:
-                page.add_redact_annot(
-                    fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, rect.y1 + 1),
-                    fill=(1, 1, 1))
+                page.add_redact_annot(r)
             except Exception:
                 pass
+            white_rects.append(r)
             block_rects[bno] = rect
         try:
             try:
@@ -551,6 +559,11 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                 page.apply_redactions()
         except Exception:
             pass
+        for r in white_rects:
+            try:
+                page.draw_rect(r, color=None, fill=(1, 1, 1))
+            except Exception:
+                pass
 
         block_tops = sorted([(b.get("bbox", [0, 0, 0, 0])[1], bi)
                              for bi, b in enumerate(text_blocks)])
@@ -788,14 +801,14 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
             for _try in range(10):
                 if _try > 0:
                     # widen the erased area before retrying at a new size
+                    wider = fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, cap_y1 + 1)
                     try:
-                        page.add_redact_annot(
-                            fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, cap_y1 + 1),
-                            fill=(1, 1, 1))
+                        page.add_redact_annot(wider)
                         try:
                             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
                         except Exception:
                             page.apply_redactions()
+                        page.draw_rect(wider, color=None, fill=(1, 1, 1))
                     except Exception:
                         pass
 
