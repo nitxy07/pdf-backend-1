@@ -11,6 +11,7 @@ Libraries used:
 
 import os
 import io
+import tempfile
 from typing import List, Tuple
 
 from pypdf import PdfReader, PdfWriter
@@ -148,8 +149,72 @@ def extract_text(input_path: str) -> str:
 
 # ---------- TEXT BLOCKS (for real text editing, like Acrobat) ----------
 
+# ---------- Real embedded fonts (not viewer-dependent standard-14 names) ----------
+#
+# insert_text(fontname="helv") only puts a NAME in the PDF and trusts the
+# viewer to supply "Helvetica" itself. Most desktop readers do, but several
+# lightweight/mobile viewers (e.g. WhatsApp's built-in PDF preview) fall back
+# to a thinner generic substitute for unembedded standard fonts, which is
+# why edited text could look noticeably fainter than the surrounding
+# original text in some viewers even though the color/size were identical.
+# Embedding Liberation Sans/Serif/Mono (metrically compatible with
+# Arial/Times/Courier, so line widths we already measured stay accurate)
+# makes every viewer render our inserted text with the exact same glyphs.
+
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+_STYLE_TO_FONTFILE = {
+    "helv": "LiberationSans-Regular.ttf",
+    "hebo": "LiberationSans-Bold.ttf",
+    "heit": "LiberationSans-Italic.ttf",
+    "hebi": "LiberationSans-BoldItalic.ttf",
+    "tiro": "LiberationSerif-Regular.ttf",
+    "tibo": "LiberationSerif-Bold.ttf",
+    "tiit": "LiberationSerif-Italic.ttf",
+    "tibi": "LiberationSerif-BoldItalic.ttf",
+    "cour": "LiberationMono-Regular.ttf",
+    "cobo": "LiberationMono-Bold.ttf",
+    "coit": "LiberationMono-Italic.ttf",
+    "cobi": "LiberationMono-BoldItalic.ttf",
+}
+
+_FONT_OBJ_CACHE: dict = {}  # style key -> fitz.Font, for text-width measurement
+
+
+def _font_obj(style_key: str):
+    """A reusable fitz.Font for measuring text width (not page-bound)."""
+    f = _FONT_OBJ_CACHE.get(style_key)
+    if f is None:
+        path = os.path.join(_FONTS_DIR, _STYLE_TO_FONTFILE.get(style_key, _STYLE_TO_FONTFILE["helv"]))
+        try:
+            f = fitz.Font(fontfile=path)
+        except Exception:
+            f = fitz.Font("helv")  # last-resort fallback so measuring never crashes
+        _FONT_OBJ_CACHE[style_key] = f
+    return f
+
+
+def _embed(page, style_key: str, page_font_cache: dict) -> str:
+    """
+    Ensures `style_key`'s real font file is embedded on this page, returning
+    the fontname to pass to insert_text/insert_textbox. Cached per page so
+    each style is only embedded once even if many edits use it.
+    """
+    cached = page_font_cache.get(style_key)
+    if cached:
+        return cached
+    path = os.path.join(_FONTS_DIR, _STYLE_TO_FONTFILE.get(style_key, _STYLE_TO_FONTFILE["helv"]))
+    embedded_name = f"LB_{style_key}"
+    try:
+        page.insert_font(fontname=embedded_name, fontfile=path)
+    except Exception:
+        embedded_name = style_key  # fall back to the standard-14 name
+    page_font_cache[style_key] = embedded_name
+    return embedded_name
+
+
 def _map_font(font_name: str, flags: int) -> str:
-    """Map a PDF font name + flags to a PyMuPDF base-14 fontname.
+    """Map a PDF font name + flags to one of our embeddable style keys.
 
     Preserves family (helvetica/arial -> helv, times/serif -> tiro,
     courier/mono -> cour) and bold/italic so the export keeps the
@@ -245,11 +310,14 @@ def _detect_block_align(line_bboxes, page_width, block_rect=None):
     return 0
 
 
-def _text_length(text: str, fontname: str, fontsize: float) -> float:
+def _text_length(text: str, style_key: str, fontsize: float) -> float:
     try:
-        return fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        return _font_obj(style_key).text_length(text, fontsize=fontsize)
     except Exception:
-        return len(text) * fontsize * 0.5
+        try:
+            return fitz.get_text_length(text, fontname=style_key, fontsize=fontsize)
+        except Exception:
+            return len(text) * fontsize * 0.5
 
 
 def _reflow_words(words, fontname, fontsize, max_width):
@@ -355,19 +423,123 @@ def _rects_overlap(a: List[float], b: List[float]) -> float:
         return 0.0
 
 
-def _insert_textbox_safe(page, rect, text, fontsize, fontname, color, align):
-    """insert_textbox with fontname fallback. Returns rect-code or -1."""
+def _insert_text_safe(page, point, text, fontsize, fontname, color, fontfile=None):
+    """
+    insert_text with a fontfile/fontname fallback.
+
+    When fontfile is given (the document's OWN embedded font, extracted by
+    _RealFontMatcher), text is drawn once with that exact font - it then
+    renders identically to untouched text in every viewer, since both use
+    the same real glyph outlines.
+
+    When no real font could be found, we fall back to a base-14 stand-in
+    (e.g. "helv"). That substitute is never embedded in the saved PDF, so
+    each viewer substitutes its own system font for it - typically a touch
+    bolder/darker than PyMuPDF's thin built-in outline - which can make
+    edited text look slightly fainter than the original. As a last-resort
+    cosmetic patch ONLY in that fallback case, we draw twice with a hairline
+    offset to roughly compensate.
+    """
+    try:
+        page.insert_text(point, text, fontsize=fontsize, fontname=fontname,
+                         fontfile=fontfile, color=color)
+        if not fontfile:
+            page.insert_text(fitz.Point(point.x + fontsize * 0.018, point.y),
+                             text, fontsize=fontsize, fontname=fontname, color=color)
+    except Exception:
+        try:
+            page.insert_text(point, text, fontsize=fontsize, color=color)
+            page.insert_text(fitz.Point(point.x + fontsize * 0.018, point.y),
+                             text, fontsize=fontsize, color=color)
+        except Exception:
+            pass
+
+
+def _insert_textbox_safe(page, rect, text, fontsize, fontname, color, align, fontfile=None):
+    """insert_textbox with fontname/fontfile fallback. Returns rect-code or -1."""
     if not text or not text.strip():
         text = " "
     try:
-        return page.insert_textbox(rect, text, fontsize=fontsize,
-                                   fontname=fontname, color=color, align=align)
+        return page.insert_textbox(rect, text, fontsize=fontsize, fontname=fontname,
+                                   fontfile=fontfile, color=color, align=align)
     except Exception:
         try:
             return page.insert_textbox(rect, text, fontsize=fontsize,
                                        color=color, align=align)
         except Exception:
             return -1
+
+
+class _RealFontMatcher:
+    """
+    Finds the ORIGINAL document's own embedded font for a given source font
+    name and makes it usable for newly inserted text, instead of silently
+    substituting a generic Helvetica/Times/Courier stand-in.
+
+    Why this matters: a base-14 substitute font (PyMuPDF's "helv"/"tiro"/
+    "cour") is NOT embedded in the saved PDF, so every viewer picks its own
+    system replacement for it - often visibly thinner/lighter than the
+    document's real (embedded) font. Reusing the real font file makes
+    edited text render identically to untouched text in every viewer.
+
+    One instance is used per apply_text_edits() call; it caches lookups so
+    each distinct font is only extracted once, and cleans up its temporary
+    font files (insert_text/insert_textbox need a real file path, not just
+    bytes) when the document is done being written.
+    """
+
+    def __init__(self, doc):
+        self.doc = doc
+        self._cache: dict = {}       # clean base font name -> (alias, fontfile) or (None, None)
+        self._temp_files: list = []
+        self._counter = 0
+
+    @staticmethod
+    def _clean(name: str) -> str:
+        return (name or "").split("+")[-1].lower()
+
+    def resolve(self, page, src_font_name: str, flags: int) -> tuple:
+        """Returns (fontname, fontfile) ready to pass straight into
+        insert_text()/insert_textbox(). Falls back to a base-14 stand-in
+        (fontfile=None) when the real font isn't embedded/extractable."""
+        key = self._clean(src_font_name)
+        if key in self._cache:
+            return self._cache[key]
+
+        result = (_map_font(src_font_name, flags), None)  # default fallback
+        try:
+            for info in page.get_fonts(full=True):
+                xref, ext = info[0], info[1]
+                basefont = info[3]
+                if self._clean(basefont) != key:
+                    continue
+                if not ext or ext == "n/a":
+                    continue  # a base-14 font, nothing real to extract
+                extracted = self.doc.extract_font(xref)
+                fontbuffer = extracted[3] if extracted and len(extracted) > 3 else None
+                if not fontbuffer:
+                    continue
+                self._counter += 1
+                tmp = tempfile.NamedTemporaryFile(suffix="." + (ext or "ttf"), delete=False)
+                tmp.write(fontbuffer)
+                tmp.close()
+                self._temp_files.append(tmp.name)
+                alias = f"RealFont{self._counter}"
+                result = (alias, tmp.name)
+                break
+        except Exception:
+            pass
+
+        self._cache[key] = result
+        return result
+
+    def cleanup(self):
+        for path in self._temp_files:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+        self._temp_files = []
 
 
 def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> None:
@@ -390,6 +562,7 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
         Reflow only kicks in on real overflow.
     """
     doc = fitz.open(input_path)
+    font_matcher = _RealFontMatcher(doc)
 
     edits_by_id = {}
     bbox_edits = []
@@ -602,7 +775,7 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                     color = (0.0, 0.0, 0.0)
                 src_font = spans_sorted[0].get("font", "helv") if spans_sorted else "helv"
                 src_flags = int(spans_sorted[0].get("flags", 0)) if spans_sorted else 0
-                fontname = _map_font(src_font, src_flags)
+                fontname, fontfile = font_matcher.resolve(page, src_font, src_flags)
                 origin = spans_sorted[0].get("origin", [lx0, ly1]) if spans_sorted else [lx0, ly1]
 
                 # How far this cell can grow right before hitting the next
@@ -617,12 +790,8 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                 needed = _text_length(new_text, fontname, fsize)
 
                 if needed <= available_width + 2:
-                    try:
-                        page.insert_text(fitz.Point(float(origin[0]), float(origin[1])),
-                                         new_text, fontsize=fsize, fontname=fontname, color=color)
-                    except Exception:
-                        page.insert_text(fitz.Point(float(origin[0]), float(origin[1])),
-                                         new_text, fontsize=fsize, color=color)
+                    _insert_text_safe(page, fitz.Point(float(origin[0]), float(origin[1])),
+                                      new_text, fsize, fontname, color, fontfile)
                     continue
 
                 # Genuinely too long even for the widened cell: wrap onto
@@ -639,12 +808,7 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                 max_lines = max(1, int((cap_y1 - float(origin[1])) // line_h) + 1)
                 baseline_y = float(origin[1])
                 for ltxt in flow[:max_lines]:
-                    try:
-                        page.insert_text(fitz.Point(lx0, baseline_y), ltxt,
-                                         fontsize=fsize, fontname=fontname, color=color)
-                    except Exception:
-                        page.insert_text(fitz.Point(lx0, baseline_y), ltxt,
-                                         fontsize=fsize, color=color)
+                    _insert_text_safe(page, fitz.Point(lx0, baseline_y), ltxt, fsize, fontname, color, fontfile)
                     baseline_y += line_h
 
         # ---- Phase 2b: real paragraphs - rewrite inside ORIGINAL x0..x1 ----
@@ -745,7 +909,7 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                         except Exception:
                             pass
                         break
-            fontname = _map_font(dom_font, dom_flags)
+            fontname, fontfile = font_matcher.resolve(page, dom_font, dom_flags)
             color = ((dom_color_int >> 16 & 255) / 255,
                      (dom_color_int >> 8 & 255) / 255,
                      (dom_color_int & 255) / 255)
@@ -770,18 +934,10 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
             if len(lines) == 1:
                 single = new_line_texts[0] if new_line_texts else " "
                 if _text_length(single, fontname, fontsize) <= block_w + 2 and line_origins and line_origins[0]:
-                    try:
-                        page.insert_text(fitz.Point(float(line_origins[0][0]), float(line_origins[0][1])),
-                                         single, fontsize=fontsize,
-                                         fontname=fontname, color=color)
-                        continue
-                    except Exception:
-                        try:
-                            page.insert_text(fitz.Point(float(line_origins[0][0]), float(line_origins[0][1])),
-                                             single, fontsize=fontsize, color=color)
-                            continue
-                        except Exception:
-                            pass
+                    _insert_text_safe(
+                        page, fitz.Point(float(line_origins[0][0]), float(line_origins[0][1])),
+                        single, fontsize, fontname, color, fontfile)
+                    continue
 
             # Unified rewrite: give PyMuPDF the WHOLE paragraph text in one
             # insert_textbox() call and let it wrap AND justify together.
@@ -818,7 +974,7 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                 write_rect = fitz.Rect(float(rect.x0), float(rect.y0),
                                        float(rect.x1), float(target_bottom))
                 rc = _insert_textbox_safe(page, write_rect, full_text,
-                                          attempt, fontname, color, orig_align)
+                                          attempt, fontname, color, orig_align, fontfile)
                 if rc is not None and rc >= 0:
                     done = True
                     break
@@ -826,8 +982,11 @@ def apply_text_edits(input_path: str, edits: List[dict], output_path: str) -> No
                     attempt = round(attempt - 0.5, 1)
             _ = done
 
-    doc.save(output_path, garbage=4, deflate=True)
-    doc.close()
+    try:
+        doc.save(output_path, garbage=4, deflate=True)
+    finally:
+        font_matcher.cleanup()
+        doc.close()
 
 
 # ---------- IMAGES & STAMPS (move / drag) ----------
